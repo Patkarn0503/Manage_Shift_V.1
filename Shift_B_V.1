@@ -1,0 +1,406 @@
+var SHEET_CONDITION = "OUT_D";
+var SHEET_HOLIDAY   = "Holiday";
+var SHEET_RESULT    = "Result";
+var SHEET_LOG       = "Log";
+var DEMAND_ONLY = new Set(["VIP","OR","LR"]);
+
+function runFill_OUT_AfterDemand() {
+  var ss = SpreadsheetApp.getActive();
+  var ui = SpreadsheetApp.getUi();
+
+  var condSh = ss.getSheetByName(SHEET_CONDITION);
+  var holSh  = ss.getSheetByName(SHEET_HOLIDAY);
+  var resSh  = ss.getSheetByName(SHEET_RESULT);
+
+  if (!condSh) throw new Error('ไม่พบชีท "' + SHEET_CONDITION + '"');
+  if (!holSh)  throw new Error('ไม่พบชีท "' + SHEET_HOLIDAY + '"');
+  if (!resSh)  throw new Error('ไม่พบชีท "' + SHEET_RESULT + '" (ต้องรันลงคอลัมน์ B ก่อน)');
+
+  // อ่านเดือนจาก Result!J1
+  var monthCell = resSh.getRange("J1").getValue();
+  if (!(monthCell instanceof Date)) {
+    ui.alert('กรุณาให้ Result!J1 เป็นวันที่ของเดือน (เช่น 2026-01-01) ก่อน');
+    return;
+  }
+
+  var year = monthCell.getFullYear();
+  var monthIndex = monthCell.getMonth();
+  var lastDay = new Date(year, monthIndex + 1, 0).getDate();
+
+  // โหลดวันหยุด
+  var holidaySet = loadHolidaySet_(holSh);
+
+  // โหลดกติกาจาก OUT_D
+  var rules = loadRulesFromOutD_(condSh);
+  if (!rules["OUT"]) throw new Error('ไม่พบแผนก "OUT" ในชีท ' + SHEET_CONDITION);
+
+  // สร้าง map คอลัมน์จาก header ของ Result
+  var colMap = buildResultColMap_(resSh);
+  // ตรวจว่ามีครบ
+  assertResultCols_(colMap);
+
+  // เติม OUT ต่อจาก Result ที่มีอยู่แล้ว
+  var stat = fillOUT_ToFixShift_AfterDemand_({
+    ss: ss,
+    resultSh: resSh,
+    rules: rules,
+    year: year,
+    monthIndex: monthIndex,
+    lastDay: lastDay,
+    holidaySet: holidaySet,
+    colMap: colMap
+  });
+
+  if (stat.issues && stat.issues.length > 0) writeIssues_(ss, stat.issues);
+  else clearLog_(ss);
+
+  ui.alert(
+    "เติม OUT ต่อจาก Result เสร็จแล้ว: " + year + "-" + pad2_(monthIndex + 1) +
+    "\n- OUT เป้าหมาย (Fix_shift): " + stat.outTarget +
+    "\n- OUT เดิมใน Result: " + stat.outBefore +
+    "\n- OUT เติมเพิ่ม: " + stat.outAdded +
+    "\n- OUT รวมตอนนี้: " + stat.outAfter +
+    "\n- ติดเงื่อนไข: " + stat.issueCount + " (ดูชีท Log)"
+  );
+}
+
+/*******************************
+ * เติม OUT ต่อจาก Result (รองรับการสลับคอลัมน์)
+ * - ใช้ header row 1 ของ Result เพื่อหา col index ของ M1 M2 E1 E2 N1 N2
+ *******************************/
+function fillOUT_ToFixShift_AfterDemand_(ctx) {
+  var ss = ctx.ss;
+  var sh = ctx.resultSh;
+  var rules = ctx.rules;
+  var year = ctx.year;
+  var monthIndex = ctx.monthIndex;
+  var lastDay = ctx.lastDay;
+  var holidaySet = ctx.holidaySet;
+  var colMap = ctx.colMap;
+
+  var outRule = rules["OUT"];
+
+  // อ่านข้อมูลทั้งบล็อค Day + slots โดยอิงตาม header map (ไม่ยึด 7 คอลัมน์ตายตัว)
+  // เพื่อความง่าย: เราจะอ่านทั้งแถวตั้งแต่คอลัมน์ 1 ถึง lastColumn แล้วใช้ colMap ชี้ตำแหน่ง
+  var lastCol = sh.getLastColumn();
+  var table = sh.getRange(2, 1, lastDay, lastCol).getValues();
+
+  function getVal(r, colIndex1Based) {
+    return table[r][colIndex1Based - 1];
+  }
+  function setVal(r, colIndex1Based, v) {
+    table[r][colIndex1Based - 1] = v;
+  }
+
+  function countDept(dept) {
+    var c = 0;
+    for (var r = 0; r < table.length; r++) {
+      ["M1","M2","E1","E2","N1","N2"].forEach(function(k){
+        var col = colMap[k];
+        if (col && String(getVal(r, col) || "").trim().toUpperCase() === dept) c++;
+      });
+    }
+    return c;
+  }
+
+  var outTarget = outRule.fixShift || 0;
+  var outBefore = countDept("OUT");
+  var need = Math.max(0, outTarget - outBefore);
+
+  var issues = [];
+
+  function isWeekendOrHoliday(day) {
+    var date = new Date(year, monthIndex, day);
+    var key = toISODateKey_(date);
+    return isWeekend_(date) || holidaySet.has(key);
+  }
+
+  function scoreShift(rule, day, shift) {
+    var wk = isWeekendOrHoliday(day);
+    var base = wk ? rule.score.weekend[shift] : rule.score.weekday[shift];
+
+    if (shift === "N" && wk) {
+      var date = new Date(year, monthIndex, day);
+      var next = new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1);
+      var nextKey = toISODateKey_(next);
+      var nextIsWeekday = !(isWeekend_(next) || holidaySet.has(nextKey));
+      if (nextIsWeekday) base += (rule.score.weekendNBeforeWD || 0);
+    }
+    return base;
+  }
+
+  function scoreME(rule, day) {
+    var wk = isWeekendOrHoliday(day);
+    var me = wk ? (rule.score.weekendME || 0) : (rule.score.weekdayME || 0);
+    var sum = scoreShift(rule, day, "M") + scoreShift(rule, day, "E");
+    return Math.max(me, sum);
+  }
+
+  function normDept_(x){ return String(x || "").trim().toUpperCase(); }
+
+  function pairOk(a, b) {
+    var ra = rules[a];
+    if (!ra) return false;
+
+    if (!b) return ra.allowEmptyPair === true;
+
+    var rb = rules[b];
+    if (!rb) return false;
+
+    if (ra.mustNotPair && ra.mustNotPair.has(b)) return false;
+    if (rb.mustNotPair && rb.mustNotPair.has(a)) return false;
+
+    if (ra.mustPair && ra.mustPair.size > 0 && !ra.mustPair.has(b)) return false;
+    if (rb.mustPair && rb.mustPair.size > 0 && !rb.mustPair.has(a)) return false;
+
+    return true;
+  }
+
+  function pickPartnerForOUT() {
+    if (outRule.allowEmptyPair === true) return null;
+    var cand = outRule.mustPair ? Array.from(outRule.mustPair) : [];
+    cand = cand.filter(function(x){ return !DEMAND_ONLY.has(x); });
+    for (var i = 0; i < cand.length; i++) {
+      var p = cand[i];
+      if (rules[p] && pairOk("OUT", p)) return p;
+    }
+    return null;
+  }
+
+  // ✅ slot definition ใช้ colMap ไม่ยึดตำแหน่ง
+  function getSlotsOfDay(r) {
+    return [
+      { shift:"M", aKey:"M1", bKey:"M2", aCol:colMap.M1, bCol:colMap.M2, a:normDept_(getVal(r,colMap.M1)), b:normDept_(getVal(r,colMap.M2)) },
+      { shift:"E", aKey:"E1", bKey:"E2", aCol:colMap.E1, bCol:colMap.E2, a:normDept_(getVal(r,colMap.E1)), b:normDept_(getVal(r,colMap.E2)) },
+      { shift:"N", aKey:"N1", bKey:"N2", aCol:colMap.N1, bCol:colMap.N2, a:normDept_(getVal(r,colMap.N1)), b:normDept_(getVal(r,colMap.N2)) }
+    ];
+  }
+
+  // PASS A: ME ก่อน
+  while (need >= 2) {
+    var best = null;
+
+    for (var day = 1; day <= lastDay; day++) {
+      var r = day - 1;
+      var slots = getSlotsOfDay(r);
+      var m = slots[0], e = slots[1];
+
+      var scME = scoreME(outRule, day);
+      if (scME <= 0) continue;
+
+      if (m.a && m.b) continue;
+      if (e.a && e.b) continue;
+
+      var canM = (!m.a && pairOk("OUT", m.b || "")) || (!m.b && pairOk("OUT", m.a || ""));
+      var canE = (!e.a && pairOk("OUT", e.b || "")) || (!e.b && pairOk("OUT", e.a || ""));
+      if (!canM || !canE) continue;
+
+      var needPartnerM = (!m.a && !m.b && outRule.allowEmptyPair !== true);
+      var needPartnerE = (!e.a && !e.b && outRule.allowEmptyPair !== true);
+
+      var partnerM = needPartnerM ? pickPartnerForOUT() : null;
+      var partnerE = needPartnerE ? pickPartnerForOUT() : null;
+      if (needPartnerM && !partnerM) continue;
+      if (needPartnerE && !partnerE) continue;
+
+      if (!best || scME > best.score) best = { day: day, score: scME };
+    }
+
+    if (!best) break;
+
+    var rr = best.day - 1;
+    var slotsC = getSlotsOfDay(rr);
+    var mC = slotsC[0], eC = slotsC[1];
+
+    // วาง OUT ใน M
+    if (!mC.a && pairOk("OUT", mC.b || "")) setVal(rr, mC.aCol, "OUT");
+    else if (!mC.b && pairOk("OUT", mC.a || "")) setVal(rr, mC.bCol, "OUT");
+
+    // ถ้า empty-empty และต้องมีคู่ -> เติมคู่
+    if (!mC.a && !mC.b && outRule.allowEmptyPair !== true) {
+      var pm = pickPartnerForOUT();
+      if (!pm) issues.push({date: toISODateKey_(new Date(year, monthIndex, best.day)), shift:"M", seat:"-", dept:"OUT", reason:"ต้องมีคู่แต่หา partner ไม่ได้"});
+      else {
+        if (normDept_(getVal(rr, mC.aCol)) === "OUT") setVal(rr, mC.bCol, pm);
+        else setVal(rr, mC.aCol, pm);
+      }
+    }
+
+    // วาง OUT ใน E
+    if (!eC.a && pairOk("OUT", eC.b || "")) setVal(rr, eC.aCol, "OUT");
+    else if (!eC.b && pairOk("OUT", eC.a || "")) setVal(rr, eC.bCol, "OUT");
+
+    if (!eC.a && !eC.b && outRule.allowEmptyPair !== true) {
+      var pe = pickPartnerForOUT();
+      if (!pe) issues.push({date: toISODateKey_(new Date(year, monthIndex, best.day)), shift:"E", seat:"-", dept:"OUT", reason:"ต้องมีคู่แต่หา partner ไม่ได้"});
+      else {
+        if (normDept_(getVal(rr, eC.aCol)) === "OUT") setVal(rr, eC.bCol, pe);
+        else setVal(rr, eC.aCol, pe);
+      }
+    }
+
+    need -= 2;
+  }
+
+  // PASS B: เดี่ยว
+  while (need > 0) {
+    var best2 = null;
+
+    for (var day2 = 1; day2 <= lastDay; day2++) {
+      var r2 = day2 - 1;
+      var slots2 = getSlotsOfDay(r2);
+
+      for (var si = 0; si < slots2.length; si++) {
+        var slot = slots2[si];
+        var sc = scoreShift(outRule, day2, slot.shift);
+        if (sc <= 0) continue;
+        if (slot.a && slot.b) continue;
+
+        // ช่อง A ว่าง
+        if (!slot.a && pairOk("OUT", slot.b || "")) {
+          var needPartner = (!slot.a && !slot.b && outRule.allowEmptyPair !== true);
+          var partner = needPartner ? pickPartnerForOUT() : null;
+          if (needPartner && !partner) continue;
+
+          if (!best2 || sc > best2.score) {
+            best2 = {day:day2, score:sc, putCol:slot.aCol, otherCol:slot.bCol, partner:partner, needPartner:needPartner, shift:slot.shift};
+          }
+        }
+        // ช่อง B ว่าง
+        else if (!slot.b && pairOk("OUT", slot.a || "")) {
+          var needPartner2 = (!slot.a && !slot.b && outRule.allowEmptyPair !== true);
+          var partner2 = needPartner2 ? pickPartnerForOUT() : null;
+          if (needPartner2 && !partner2) continue;
+
+          if (!best2 || sc > best2.score) {
+            best2 = {day:day2, score:sc, putCol:slot.bCol, otherCol:slot.aCol, partner:partner2, needPartner:needPartner2, shift:slot.shift};
+          }
+        }
+      }
+    }
+
+    if (!best2) {
+      issues.push({date: year + "-" + pad2_(monthIndex + 1), shift:"-", seat:"-", dept:"OUT", reason:"หา slot ที่วาง OUT ได้ไม่เจอ"});
+      break;
+    }
+
+    var rr2 = best2.day - 1;
+    setVal(rr2, best2.putCol, "OUT");
+    if (best2.needPartner && best2.partner && !normDept_(getVal(rr2, best2.otherCol))) {
+      setVal(rr2, best2.otherCol, best2.partner);
+    }
+    need -= 1;
+  }
+
+  // เขียนกลับทั้งบล็อค
+  sh.getRange(2, 1, lastDay, lastCol).setValues(table);
+
+  var outAfter = countDept("OUT");
+  var outAdded = Math.max(0, outAfter - outBefore);
+
+  return {
+    outTarget: outTarget,
+    outBefore: outBefore,
+    outAdded: outAdded,
+    outAfter: outAfter,
+    issues: issues,
+    issueCount: issues.length
+  };
+}
+
+/*******************************
+ * RESULT: build column map from header row 1
+ *******************************/
+function buildResultColMap_(resSh) {
+  var headers = resSh.getRange(1,1,1,resSh.getLastColumn()).getValues()[0];
+  var map = {};
+  for (var i=0;i<headers.length;i++){
+    var h = String(headers[i]||"").trim();
+    if (!h) continue;
+    map[h.toUpperCase()] = i+1;
+  }
+  // normalize keys (M1..)
+  return {
+    DAY: map["DAY"],
+    M1: map["M1"], M2: map["M2"],
+    E1: map["E1"], E2: map["E2"],
+    N1: map["N1"], N2: map["N2"]
+  };
+}
+function assertResultCols_(colMap){
+  var need = ["DAY","M1","M2","E1","E2","N1","N2"];
+  var miss = need.filter(function(k){ return !colMap[k]; });
+  if (miss.length) throw new Error("Result header ขาดคอลัมน์: " + miss.join(", "));
+}
+
+/*******************************
+ * RULES LOADER (ของเดิม)
+ *******************************/
+function loadRulesFromOutD_(sh) {
+  var lastRow = sh.getLastRow();
+  if (lastRow < 2) return {};
+
+  var data = sh.getRange(2, 1, lastRow - 1, 14).getValues();
+  var rules = {};
+  function num(x){ var n = Number(x); return isFinite(n) ? n : 0; }
+
+  for (var i = 0; i < data.length; i++) {
+    var row = data[i];
+    var dept = String(row[0] || "").trim().toUpperCase();
+    if (!dept) continue;
+
+    var requireStr = String(row[1] || "").trim();
+    var mustPairStr = String(row[2] || "").trim().toUpperCase();
+    var mustNotPairStr = String(row[3] || "").trim().toUpperCase();
+
+    var mustPairSet = mustPairStr ? new Set(mustPairStr.split(/\s+/).filter(Boolean)) : null;
+    var allowEmptyPair = false;
+    if (mustPairSet && mustPairSet.has("EMP")) { allowEmptyPair = true; mustPairSet.delete("EMP"); }
+
+    rules[dept] = {
+      dept: dept,
+      requireTokens: tokenize_(requireStr),
+      mustPair: mustPairSet,
+      allowEmptyPair: allowEmptyPair,
+      mustNotPair: mustNotPairStr ? new Set(mustNotPairStr.split(/\s+/).filter(Boolean)) : new Set(),
+      score: {
+        weekday: { M: num(row[4]), E: num(row[5]), N: num(row[6]) },
+        weekend: { M: num(row[7]), E: num(row[8]), N: num(row[9]) },
+        weekendNBeforeWD: num(row[10]),
+        weekdayME: num(row[11]),
+        weekendME: num(row[12])
+      },
+      fixShift: num(row[13])
+    };
+  }
+  return rules;
+}
+
+/*******************************
+ * LOG + HELPERS (ของเดิม)
+ *******************************/
+function writeIssues_(ss, issues) {
+  var sh = ss.getSheetByName(SHEET_LOG);
+  if (!sh) sh = ss.insertSheet(SHEET_LOG);
+  sh.clear();
+  sh.getRange(1,1,1,5).setValues([["Date","Shift","Seat","Dept","Reason"]]).setFontWeight("bold");
+  var rows = issues.map(function(x){ return [x.date, x.shift, x.seat, x.dept, x.reason]; });
+  if (rows.length) {
+    sh.getRange(2,1,rows.length,5).setValues(rows);
+    sh.autoResizeColumns(1,5);
+  }
+}
+function clearLog_(ss){ var sh=ss.getSheetByName(SHEET_LOG); if (sh) sh.clear(); }
+
+function loadHolidaySet_(holidaySh) {
+  var lastRow = holidaySh.getLastRow();
+  if (lastRow < 1) return new Set();
+  var vals = holidaySh.getRange(1,1,lastRow,1).getValues();
+  var set = new Set();
+  for (var i=0;i<vals.length;i++){ var v=vals[i][0]; if (v instanceof Date) set.add(toISODateKey_(v)); }
+  return set;
+}
+function tokenize_(s){ if(!s) return []; return String(s).split(/\s+/).map(function(x){return x.trim();}).filter(Boolean); }
+function isWeekend_(date){ var d=date.getDay(); return d===0||d===6; }
+function toISODateKey_(date){ return date.getFullYear()+"-"+pad2_(date.getMonth()+1)+"-"+pad2_(date.getDate()); }
+function pad2_(n){ n=String(n); return n.length===1?("0"+n):n; }
