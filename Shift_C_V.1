@@ -1,0 +1,313 @@
+/********************************
+ * STEP C (FULL): เติม WW/WM คู่กับ OUT ที่ยังว่างใน Result
+ * - อ่านกติกาจาก OUT_D โดยหา col จาก header
+ * - อ่าน/เขียน Result โดยหา col จาก header (รองรับสลับคอลัมน์ M/E/N ได้)
+ * - เลือกลงจาก Ideal_shift มาก -> น้อย
+ * - เขียน Log
+ ********************************/
+function runFill_WW_WM_PairOut() {
+  var ss   = SpreadsheetApp.getActive();
+  var ui   = SpreadsheetApp.getUi();
+
+  var RULE_SHEET   = "OUT_D";
+  var RESULT_SHEET = "Result";
+  var LOG_SHEET    = "Log";
+
+  var ruleSh = ss.getSheetByName(RULE_SHEET);
+  var resSh  = ss.getSheetByName(RESULT_SHEET);
+  var logSh  = ss.getSheetByName(LOG_SHEET) || ss.insertSheet(LOG_SHEET);
+
+  if (!ruleSh) throw new Error('ไม่พบชีท "' + RULE_SHEET + '"');
+  if (!resSh)  throw new Error('ไม่พบชีท "' + RESULT_SHEET + '"');
+
+  // ===== 1) โหลด rules จาก OUT_D (ใช้หัว Ideal_shift และรองรับสูตร) =====
+  var rules = loadRules_StepC_IdealShift_(ruleSh);
+
+  if (!rules["OUT"]) throw new Error('ไม่พบแผนก "OUT" ในชีท ' + RULE_SHEET);
+  if (!rules["WM"])  throw new Error('ไม่พบแผนก "WM" ในชีท ' + RULE_SHEET);
+  if (!rules["WW"])  throw new Error('ไม่พบแผนก "WW" ในชีท ' + RULE_SHEET);
+
+  // ===== 2) candidates เฉพาะ WM/WW =====
+  var DEMAND_ONLY = new Set(["VIP","OR","LR"]); // กันไม่ให้เอามาเติม
+  var candidates = ["WM","WW"].filter(function(d){
+    return rules[d] && !DEMAND_ONLY.has(d);
+  });
+
+  // เรียง ideal_shift มาก -> น้อย
+  candidates.sort(function(a,b){
+    return (rules[b].ideal || 0) - (rules[a].ideal || 0);
+  });
+
+  // ===== 3) เตรียม Log =====
+  logSh.clear();
+  logSh.getRange(1,1,1,5).setValues([["Type","Row","Col","Detail","Reason"]]).setFontWeight("bold");
+  var logRows = [];
+
+  logRows.push([
+    "DEBUG","","",
+    "candidates",
+    "WM=" + (rules["WM"].ideal || 0) + ", WW=" + (rules["WW"].ideal || 0)
+  ]);
+
+  // ===== 4) อ่าน Result แบบยืดหยุ่นจาก header =====
+  var lastRow = resSh.getLastRow();
+  if (lastRow < 2) {
+    logRows.push(["DEBUG","","","Result ไม่มีแถวข้อมูล",""]);
+    flushLog_(logSh, logRows);
+    ui.alert("Result ยังไม่มีข้อมูล");
+    return;
+  }
+
+  var colMap = buildResultColMap_StepC_(resSh); // {DAY,M1,M2,E1,E2,N1,N2}
+  assertResultCols_StepC_(colMap);
+
+  // อ่านทั้งช่วงตั้งแต่คอลัมน์ 1 ถึง lastColumn เพื่อไม่ผูกตำแหน่ง
+  var lastCol = resSh.getLastColumn();
+  var dataAll = resSh.getRange(2, 1, lastRow - 1, lastCol).getValues(); // รวมทั้ง DAY และคอลัมน์อื่นๆ
+
+  function norm(x){ return String(x || "").trim().toUpperCase(); }
+
+  // helper: อ่าน/เขียนค่าใน dataAll ด้วย colIndex (1-based)
+  function getVal(r0, col1){ return dataAll[r0][col1 - 1]; }
+  function setVal(r0, col1, v){ dataAll[r0][col1 - 1] = v; }
+
+  // ===== 4.1) นับ OUT ที่ต้องจับคู่ =====
+  var outNeedPair = 0;
+  for (var r = 0; r < dataAll.length; r++) {
+    // ตรวจทุก shift seat เป็นคู่ (M1-M2, E1-E2, N1-N2)
+    var pairs = [
+      { a: colMap.M1, b: colMap.M2 },
+      { a: colMap.E1, b: colMap.E2 },
+      { a: colMap.N1, b: colMap.N2 }
+    ];
+
+    for (var p = 0; p < pairs.length; p++) {
+      var aV = norm(getVal(r, pairs[p].a));
+      var bV = norm(getVal(r, pairs[p].b));
+
+      if (aV === "OUT" && !bV) outNeedPair++;
+      if (bV === "OUT" && !aV) outNeedPair++;
+    }
+  }
+  logRows.push(["DEBUG","","","OUT_need_pair="+outNeedPair,""]);
+
+  // ===== 5) เติม WW/WM คู่กับ OUT ที่ว่าง =====
+  var filled = 0;
+
+  // วนทีละวัน/ทีละกะ: ถ้าพบ OUT และอีกฝั่งว่าง -> ใส่ partner
+  for (var r2 = 0; r2 < dataAll.length; r2++) {
+    var pairs2 = [
+      { shift:"M", outA: colMap.M1, outB: colMap.M2 },
+      { shift:"E", outA: colMap.E1, outB: colMap.E2 },
+      { shift:"N", outA: colMap.N1, outB: colMap.N2 }
+    ];
+
+    for (var pp = 0; pp < pairs2.length; pp++) {
+      var aCol = pairs2[pp].outA;
+      var bCol = pairs2[pp].outB;
+
+      var aVal = norm(getVal(r2, aCol));
+      var bVal = norm(getVal(r2, bCol));
+
+      // เคส OUT อยู่ฝั่ง A และฝั่ง B ว่าง
+      if (aVal === "OUT" && !bVal) {
+        var placedA = placePartner_(r2, bCol, "OUT", candidates, rules, logRows, resSh, colMap, getVal, setVal);
+        if (placedA) filled++;
+        continue;
+      }
+
+      // เคส OUT อยู่ฝั่ง B และฝั่ง A ว่าง
+      if (bVal === "OUT" && !aVal) {
+        var placedB = placePartner_(r2, aCol, "OUT", candidates, rules, logRows, resSh, colMap, getVal, setVal);
+        if (placedB) filled++;
+        continue;
+      }
+    }
+  }
+
+  // ===== 6) เขียนกลับ Result + Log =====
+  resSh.getRange(2, 1, lastRow - 1, lastCol).setValues(dataAll);
+
+  logRows.push(["DEBUG","","","filled="+filled,"WM_left="+(rules["WM"].ideal||0)+", WW_left="+(rules["WW"].ideal||0)]);
+  flushLog_(logSh, logRows);
+
+  ui.alert(
+    "Step C เสร็จแล้ว (เติม WW/WM คู่กับ OUT)\n" +
+    "- OUT ที่ต้องจับคู่: " + outNeedPair + "\n" +
+    "- เติมสำเร็จ: " + filled + "\n" +
+    "- เหลือ WM: " + (rules["WM"].ideal || 0) + "\n" +
+    "- เหลือ WW: " + (rules["WW"].ideal || 0) + "\n" +
+    "ดูรายละเอียดที่ชีท Log"
+  );
+}
+
+/********************************
+ * วาง partner ลงช่อง pairCol ที่ว่าง
+ ********************************/
+function placePartner_(r0, pairCol1Based, outDept, candidates, rules, logRows, resSh, colMap, getVal, setVal) {
+  var placed = false;
+
+  for (var i = 0; i < candidates.length; i++) {
+    var dept = candidates[i];
+
+    // โควต้า ideal_shift เหลือไหม
+    if ((rules[dept].ideal || 0) <= 0) {
+      logRows.push(["SKIP", r0+2, pairCol1Based, dept, "Ideal_shift <= 0"]);
+      continue;
+    }
+
+    // pair constraint สองทาง (OUT -> dept และ dept -> OUT)
+    if (!pairAllowed_(outDept, dept, rules)) {
+      logRows.push(["BLOCK", r0+2, pairCol1Based, dept, outDept + " Must_Pair/Must_Not_Pair บล็อก"]);
+      continue;
+    }
+    if (!pairAllowed_(dept, outDept, rules)) {
+      logRows.push(["BLOCK", r0+2, pairCol1Based, dept, dept + " Must_Pair/Must_Not_Pair บล็อก"]);
+      continue;
+    }
+
+    // วาง
+    setVal(r0, pairCol1Based, dept);
+    rules[dept].ideal--;
+    placed = true;
+    logRows.push(["FILL", r0+2, pairCol1Based, dept, "OK"]);
+    break;
+  }
+
+  if (!placed) {
+    logRows.push(["FAIL", r0+2, pairCol1Based, "(none)", "ไม่มี candidate ที่ผ่านเงื่อนไข/เหลือ Ideal_shift"]);
+  }
+
+  return placed;
+}
+
+/********************************
+ * RESULT: สร้าง colMap จาก header แถว 1 (ยืดหยุ่นตามชื่อหัวคอลัมน์)
+ ********************************/
+function buildResultColMap_StepC_(resSh) {
+  var headers = resSh.getRange(1,1,1,resSh.getLastColumn()).getValues()[0];
+  var map = {};
+  for (var i=0;i<headers.length;i++){
+    var h = String(headers[i]||"").trim().toUpperCase();
+    if (!h) continue;
+    map[h] = i+1; // 1-based
+  }
+  return {
+    DAY: map["DAY"],
+    M1: map["M1"], M2: map["M2"],
+    E1: map["E1"], E2: map["E2"],
+    N1: map["N1"], N2: map["N2"]
+  };
+}
+function assertResultCols_StepC_(colMap){
+  var need = ["DAY","M1","M2","E1","E2","N1","N2"];
+  var miss = need.filter(function(k){ return !colMap[k]; });
+  if (miss.length) throw new Error("Result header ขาดคอลัมน์: " + miss.join(", "));
+}
+
+/********************************
+ * (ของเดิม) LOAD RULES: หา column จากหัวแถว 1
+ ********************************/
+function loadRules_StepC_IdealShift_(sh) {
+  var lastRow = sh.getLastRow();
+  var lastCol = sh.getLastColumn();
+  if (lastRow < 2) return {};
+
+  var header = sh.getRange(1, 1, 1, lastCol).getValues()[0];
+
+  function normHeader(x){
+    return String(x || "").trim().toLowerCase().replace(/\s+/g, "_");
+  }
+
+  var colDept = -1, colMustPair = -1, colMustNot = -1, colIdeal = -1;
+
+  for (var c = 0; c < header.length; c++) {
+    var h = normHeader(header[c]);
+    if (h === "department") colDept = c + 1;
+    if (h === "must_pair") colMustPair = c + 1;
+    if (h === "must_not_pair") colMustNot = c + 1;
+    if (h === "ideal_shift") colIdeal = c + 1;
+  }
+
+  if (colIdeal < 0) colIdeal = 15;
+
+  if (colDept < 0) throw new Error("ไม่พบ header Department แถว 1");
+  if (colMustPair < 0) throw new Error("ไม่พบ header Must_Pair แถว 1");
+  if (colMustNot < 0) throw new Error("ไม่พบ header Must_Not_Pair แถว 1");
+
+  var deptVals = sh.getRange(2, colDept, lastRow-1, 1).getValues();
+  var mpVals   = sh.getRange(2, colMustPair, lastRow-1, 1).getValues();
+  var mnVals   = sh.getRange(2, colMustNot, lastRow-1, 1).getValues();
+  var idVals   = sh.getRange(2, colIdeal, lastRow-1, 1).getDisplayValues();
+
+  function parseList_(v) {
+    var s = String(v || "").trim().toUpperCase();
+    if (!s) return new Set();
+    return new Set(s.split(/\s+/).filter(Boolean));
+  }
+
+  function toNumFromDisplay_(v) {
+    var s = String(v || "").trim().replace(/,/g, "");
+    var m = s.match(/-?\d+(\.\d+)?/);
+    if (!m) return 0;
+    var n = Number(m[0]);
+    return isFinite(n) ? n : 0;
+  }
+
+  var rules = {};
+  for (var i = 0; i < deptVals.length; i++) {
+    var dept = String(deptVals[i][0] || "").trim().toUpperCase();
+    if (!dept) continue;
+
+    var mustPair = parseList_(mpVals[i][0]);
+    var allowEmptyPair = false;
+    if (mustPair.has("EMP")) { allowEmptyPair = true; mustPair.delete("EMP"); }
+
+    rules[dept] = {
+      mustPair: mustPair,
+      mustNot:  parseList_(mnVals[i][0]),
+      ideal:    toNumFromDisplay_(idVals[i][0]),
+      allowEmptyPair: allowEmptyPair
+    };
+  }
+
+  return rules;
+}
+
+/********************************
+ * (ของเดิม) PAIR CHECK (ฝั่งเดียว)
+ ********************************/
+function pairAllowed_(a, b, rules) {
+  var ra = rules[a];
+  if (!ra) return false;
+
+  if (!b) return ra.allowEmptyPair === true;
+
+  if (ra.mustNot && ra.mustNot.has(b)) return false;
+  if (ra.mustPair && ra.mustPair.size > 0 && !ra.mustPair.has(b)) return false;
+
+  return true;
+}
+
+/********************************
+ * (ของเดิม) LOG helper
+ ********************************/
+function flushLog_(logSh, rows) {
+  if (!rows || rows.length === 0) return;
+
+  var maxCols = 0;
+  rows.forEach(function(r){
+    if (r && r.length > maxCols) maxCols = r.length;
+  });
+  if (maxCols === 0) return;
+
+  var out = rows.map(function(r){
+    r = r || [];
+    while (r.length < maxCols) r.push("");
+    if (r.length > maxCols) r = r.slice(0, maxCols);
+    return r;
+  });
+
+  logSh.getRange(2, 1, out.length, maxCols).setValues(out);
+  logSh.autoResizeColumns(1, maxCols);
+}
