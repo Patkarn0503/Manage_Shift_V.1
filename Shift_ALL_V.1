@@ -1,0 +1,37 @@
+function runSchedule_All_A_to_F() {
+  const ui = SpreadsheetApp.getUi();
+
+  const confirm = ui.alert(
+    "ยืนยันการรันทั้งหมด",
+    "ระบบจะรันขั้นตอน A → F ต่อเนื่อง\n(A: Require → B: OUT → C: คู่ OUT → D: PRI/OTH → E: OPD → F: ICU/ER/WW/WM)\n\nต้องการดำเนินการต่อหรือไม่?",
+    ui.ButtonSet.OK_CANCEL
+  );
+
+  if (confirm !== ui.Button.OK) {
+    SpreadsheetApp.getActive().toast("ยกเลิกการรันทั้งหมด");
+    return;
+  }
+
+  try {
+    runSchedule_DemandOnly();                 // A
+    runFill_OUT_AfterDemand();                // B
+    runFill_WW_WM_PairOut();                  // C
+    runStepD_Fill_PRI_OTH_3Pass();            // D
+    runStepE1_Fill_OPD_Only_3Pass();          // E
+    runStepE2_Fill_ICU_ER_WW_WM_3Pass();       // F
+
+    SpreadsheetApp.getActive().toast(
+      "รันครบ A–F เรียบร้อยแล้ว ✅",
+      "ลงเวรอัตโนมัติ",
+      10
+    );
+
+  } catch (err) {
+    ui.alert(
+      "เกิดข้อผิดพลาดระหว่างรัน",
+      err.message || String(err),
+      ui.ButtonSet.OK
+    );
+    throw err;
+  }
+}
