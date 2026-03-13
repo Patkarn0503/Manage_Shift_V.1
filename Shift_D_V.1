@@ -1,0 +1,390 @@
+/********************************
+ * STEP D (3-PASS): เติม PRI / OTH ต่อจาก Result เดิม
+ * Result format: Day | M1 M2 | E1 E2 | N1 N2
+ *
+ * ใช้สีไฮไลท์ใน Result:
+ * - วันหยุด/เสาร์อาทิตย์ = แถวสีเดียวกัน (weekendColor)
+ * - Weekend_N_before_WD = แถววันนี้เป็น weekend แต่แถววันถัดไปเป็น weekday และเป็นเวร N
+ *
+ * 3 Pass:
+ * 1) เติมเฉพาะ Weekday ทั้งเดือนก่อน
+ * 2) เติม Weekend (ยกเว้น N_before_WD)
+ * 3) เติม Weekend_N_before_WD
+ ********************************/
+
+function runStepD_Fill_PRI_OTH_3Pass() {
+  const ss = SpreadsheetApp.getActive();
+
+  const RULE_SHEET   = "OUT_D";
+  const RESULT_SHEET = "Result";
+  const LOG_SHEET    = "Log";
+
+  const TARGET_DEPTS = ["PRI", "OTH"];
+
+  // ----- ปรับน้ำหนักได้ -----
+  const W_DESIRE      = 100;  // น้ำหนักค่าความอยากของกะนั้นๆ
+  const W_ME_BONUS    = 80;   // โบนัสจาก *_ME ถ้ากำลังลง M/E และมีโอกาสทำ M+E
+  const W_QUOTA_RATIO = 50;   // โบนัสความแฟร์ เหลือโควต้าเยอะให้โอกาส
+  // -------------------------
+
+  const ruleSh   = ss.getSheetByName(RULE_SHEET);
+  const resultSh = ss.getSheetByName(RESULT_SHEET);
+  if (!ruleSh)   throw new Error('ไม่พบชีท "' + RULE_SHEET + '"');
+  if (!resultSh) throw new Error('ไม่พบชีท "' + RESULT_SHEET + '"');
+
+  const rules = readRulesFromOutD_(ruleSh);
+  TARGET_DEPTS.forEach(d => {
+    if (!rules[d]) throw new Error('ไม่พบกติกาของแผนก "' + d + '" ในชีท OUT_D');
+  });
+
+  const range = resultSh.getDataRange();
+  const data = range.getValues();
+  const bgs  = range.getBackgrounds();
+  if (data.length < 2) return;
+
+  const lastRow = data.length;
+
+  // Detect weekend color
+  const weekendColor = detectWeekendColor_(bgs);
+  function isWeekendRow_(r) {
+    const c = normColor_(bgs[r][0]);
+    return c && c !== "#ffffff" && c !== "white" && c === weekendColor;
+  }
+
+  // Used counts
+  const used = {};
+  Object.keys(rules).forEach(d => used[d] = 0);
+
+  for (let r = 1; r < lastRow; r++) {
+    for (let c = 1; c <= 6; c++) {
+      const d = norm_(data[r][c]);
+      if (d && used[d] != null) used[d]++;
+    }
+  }
+
+  // Remaining quotas
+  const remaining = {};
+  TARGET_DEPTS.forEach(d => {
+    remaining[d] = Math.max(0, Number(rules[d].ideal || 0) - Number(used[d] || 0));
+  });
+
+  // Timeline
+  const timeline = [];
+  for (let r = 1; r < lastRow; r++) {
+    const day = data[r][0];
+    if (day === "" || day == null) continue;
+    timeline.push({ r, day, shift: "M", cols: [1, 2] });
+    timeline.push({ r, day, shift: "E", cols: [3, 4] });
+    timeline.push({ r, day, shift: "N", cols: [5, 6] });
+  }
+
+  // Precompute slot type for each timeline index (จากสี)
+  // slotType: "WEEKDAY" | "WEEKEND" | "WN_B4_WD"
+  const slotType = timeline.map(t => {
+    const weekendToday = isWeekendRow_(t.r);
+    const weekendTomorrow = (t.r + 1 < lastRow) ? isWeekendRow_(t.r + 1) : false;
+    const isWN = (t.shift === "N" && weekendToday && !weekendTomorrow);
+    if (isWN) return "WN_B4_WD";
+    if (weekendToday) return "WEEKEND";
+    return "WEEKDAY";
+  });
+
+  // Log
+  const log = [];
+  log.push(["ts","step","pass","day","shift","cell","dept","action","reason","score"]);
+
+  // ME bonus helper
+  function mePotentialBonus_(dept, rowIndex, isWeekend) {
+    const meVal = isWeekend ? Number(rules[dept].meWeekend || 0) : Number(rules[dept].meWeekday || 0);
+    if (meVal <= 0) return 0;
+
+    const mFilled = [norm_(data[rowIndex][1]), norm_(data[rowIndex][2])].filter(Boolean);
+    const eFilled = [norm_(data[rowIndex][3]), norm_(data[rowIndex][4])].filter(Boolean);
+
+    const mHasDept = mFilled.includes(dept);
+    const eHasDept = eFilled.includes(dept);
+
+    const mHasEmpty = (mFilled.length < 2);
+    const eHasEmpty = (eFilled.length < 2);
+
+    // มีโอกาสทำ M+E ในวันเดียวกัน
+    if ((mHasDept && eHasEmpty) || (eHasDept && mHasEmpty) || (mHasEmpty && eHasEmpty)) {
+      return meVal * W_ME_BONUS;
+    }
+    return 0;
+  }
+
+  // Core fill for one pass
+  function runPass_(passName, acceptTypeFn) {
+    let filledThisPass = 0;
+
+    for (let i = 0; i < timeline.length; i++) {
+      if (remaining.PRI <= 0 && remaining.OTH <= 0) break;
+
+      if (!acceptTypeFn(slotType[i])) continue;
+
+      const t = timeline[i];
+      const type = slotType[i]; // WEEKDAY/WEEKEND/WN_B4_WD
+
+      const weekendToday = (type !== "WEEKDAY"); // WEEKEND or WN_B4_WD ถือว่าเป็น weekend day
+      const isWeekendNightBeforeWD = (type === "WN_B4_WD");
+
+      for (const col of t.cols) {
+        if (norm_(data[t.r][col])) continue;
+        if (remaining.PRI <= 0 && remaining.OTH <= 0) break;
+
+        const inThisShift = t.cols.map(c => norm_(data[t.r][c])).filter(Boolean);
+
+        let bestDept = "";
+        let bestScore = -1;
+        let bestReason = "";
+
+        for (const dept of TARGET_DEPTS) {
+          if (remaining[dept] <= 0) continue;
+
+          // 1) availability by desire (0=ห้าม)
+          const desire = getDesire_(rules[dept], t.shift, weekendToday, isWeekendNightBeforeWD);
+          if (desire <= 0) continue;
+
+          // 2) Must_Not_Pair
+          const hitNot = hitList_(rules[dept].mustNotPair, inThisShift);
+          if (hitNot) continue;
+
+          // 3) Must_Pair: มีคู่แล้ว หรือ ว่างทั้งคู่ (ลงได้ก่อน)
+          const mp = rules[dept].mustPair || [];
+          if (mp.length) {
+            const hasPairAlready = mp.some(x => inThisShift.indexOf(x) >= 0);
+            const bothEmpty = (inThisShift.length === 0);
+            if (!hasPairAlready && !bothEmpty) continue;
+          }
+
+          // 4) consecutive > 2
+          const cons = checkNoMoreThan2Consecutive_(timeline, data, i, dept);
+          if (!cons.ok) continue;
+
+          // SCORE (ภายใน pass เดียวกัน)
+          // ใน pass 1 มันจะเจอแต่ weekday อยู่แล้ว, pass 2 เจอแต่ weekend, pass3 เจอแต่ WN_B4_WD
+          // ดังนั้นไม่ต้องมี weekdayBonus อีก
+          let score = desire * W_DESIRE;
+
+          // ME bonus เฉพาะ M/E
+          if (t.shift === "M" || t.shift === "E") {
+            score += mePotentialBonus_(dept, t.r, weekendToday);
+          }
+
+          // quota ratio bonus
+          const ideal = Math.max(1, Number(rules[dept].ideal || 0));
+          score += (remaining[dept] / ideal) * W_QUOTA_RATIO;
+
+          if (score > bestScore) {
+            bestScore = score;
+            bestDept = dept;
+            bestReason =
+              `type=${type}, desire=${desire}, MEbonus=${(t.shift==="M"||t.shift==="E")? (mePotentialBonus_(dept, t.r, weekendToday)/W_ME_BONUS):0}, quota=${remaining[dept]}/${ideal}`;
+          }
+        }
+
+        if (!bestDept) {
+          log.push([now_(),"D",passName,t.day,t.shift,cellA1_(t.r, col),"","NOFILL","no candidate passed",""]);
+          continue;
+        }
+
+        // PLACE
+        resultSh.getRange(t.r + 1, col + 1).setValue(bestDept);
+        data[t.r][col] = bestDept;
+        remaining[bestDept]--;
+
+        filledThisPass++;
+        log.push([now_(),"D",passName,t.day,t.shift,cellA1_(t.r, col),bestDept,"FILL",bestReason,String(bestScore)]);
+      }
+    }
+
+    return filledThisPass;
+  }
+
+  // --------- RUN 3 PASSES ---------
+  const filled1 = runPass_("PASS1_WEEKDAY", t => t === "WEEKDAY");
+  const filled2 = runPass_("PASS2_WEEKEND", t => t === "WEEKEND");
+  const filled3 = runPass_("PASS3_WN_BEFORE_WD", t => t === "WN_B4_WD");
+
+  writeLog_(ss, LOG_SHEET, log);
+
+  SpreadsheetApp.getActive().toast(
+    `Step D 3-pass เสร็จ | เติม: Wkdy=${filled1}, Wkend=${filled2}, WNbefWD=${filled3} | เหลือ PRI=${remaining.PRI}, OTH=${remaining.OTH}`,
+    "runStepD_Fill_PRI_OTH_3Pass",
+    10
+  );
+}
+
+/* =========================================================
+ * RULES (OUT_D)
+ * ========================================================= */
+function readRulesFromOutD_(sh) {
+  const v = sh.getDataRange().getValues();
+  if (v.length < 2) throw new Error("OUT_D ไม่มีข้อมูล");
+
+  const headers = v[0].map(x => String(x || "").trim());
+
+  const cDept = findCol_(headers, ["Department"]);
+  const cMustPair = findCol_(headers, ["Must_Pair"]);
+  const cMustNot = findCol_(headers, ["Must_Not_Pair"]);
+
+  const cWeekdayM = findCol_(headers, ["Weekday_M"]);
+  const cWeekdayE = findCol_(headers, ["Weekday_E"]);
+  const cWeekdayN = findCol_(headers, ["Weekday_N"]);
+
+  const cWeekendM = findCol_(headers, ["Weekend_M"]);
+  const cWeekendE = findCol_(headers, ["Weekend_E"]);
+  const cWeekendN = findCol_(headers, ["Weekend_N"]);
+  const cWeekendNBefore = findCol_(headers, ["Weekend_N_before_WD"]);
+
+  const cWeekdayME = findCol_(headers, ["Weekday_ME"]);
+  const cWeekendME = findCol_(headers, ["Weekend_ME"]);
+
+  const cIdeal = findCol_(headers, ["Ideal_shift"]);
+
+  const mustHave = [cDept,cMustPair,cMustNot,cWeekdayM,cWeekdayE,cWeekdayN,cWeekendM,cWeekendE,cWeekendN,cWeekendNBefore,cWeekdayME,cWeekendME,cIdeal];
+  if (mustHave.some(x => x === -1)) {
+    throw new Error("หัวคอลัมน์ใน OUT_D ไม่ครบ/ชื่อไม่ตรง (ตรวจหัวคอลัมน์ให้ตรง)");
+  }
+
+  const rules = {};
+  for (let r = 1; r < v.length; r++) {
+    const dept = norm_(v[r][cDept]);
+    if (!dept) continue;
+
+    rules[dept] = {
+      dept,
+      mustPair: splitList_(v[r][cMustPair]).map(norm_).filter(Boolean),
+      mustNotPair: splitList_(v[r][cMustNot]).map(norm_).filter(Boolean),
+      ideal: Number(v[r][cIdeal] || 0),
+
+      avail: {
+        weekday: {
+          M: Number(v[r][cWeekdayM] || 0),
+          E: Number(v[r][cWeekdayE] || 0),
+          N: Number(v[r][cWeekdayN] || 0),
+        },
+        weekend: {
+          M: Number(v[r][cWeekendM] || 0),
+          E: Number(v[r][cWeekendE] || 0),
+          N: Number(v[r][cWeekendN] || 0),
+          N_before_WD: Number(v[r][cWeekendNBefore] || 0),
+        }
+      },
+
+      meWeekday: Number(v[r][cWeekdayME] || 0),
+      meWeekend: Number(v[r][cWeekendME] || 0),
+    };
+  }
+  return rules;
+}
+
+/* ===============================
+ * Desire getter
+ * =============================== */
+function getDesire_(rule, shiftKey, isWeekend, isWeekendNightBeforeWD) {
+  if (!rule || !rule.avail) return 0;
+  if (isWeekend && shiftKey === "N" && isWeekendNightBeforeWD) {
+    return Number(rule.avail.weekend.N_before_WD || 0);
+  }
+  const side = isWeekend ? "weekend" : "weekday";
+  return Number(rule.avail[side][shiftKey] || 0);
+}
+
+/* ===============================
+ * Consecutive check
+ * =============================== */
+function checkNoMoreThan2Consecutive_(timeline, data, idx, dept) {
+  const d = norm_(dept);
+  let run = 1;
+
+  for (let i = idx - 1; i >= 0; i--) {
+    if (shiftHasDept_(timeline[i], data, d)) run++;
+    else break;
+  }
+  for (let i = idx + 1; i < timeline.length; i++) {
+    if (shiftHasDept_(timeline[i], data, d)) run++;
+    else break;
+  }
+
+  if (run > 2) return { ok: false, reason: "ติดกันเกิน 2 เวร (run=" + run + ")" };
+  return { ok: true, reason: "" };
+}
+
+function shiftHasDept_(t, data, dept) {
+  return t.cols.some(c => norm_(data[t.r][c]) === dept);
+}
+
+/* ===============================
+ * Weekend color detect
+ * =============================== */
+function detectWeekendColor_(bgs) {
+  for (let r = 1; r < bgs.length; r++) {
+    const c = normColor_(bgs[r][0]);
+    if (c && c !== "#ffffff" && c !== "white") return c;
+  }
+  // fallback ของ Step A
+  return "#f6c6a5";
+}
+function normColor_(c) {
+  if (!c) return "";
+  return String(c).trim().toLowerCase();
+}
+
+/* ===============================
+ * Utils
+ * =============================== */
+function writeLog_(ss, sheetName, rows) {
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) sh = ss.insertSheet(sheetName);
+  const start = sh.getLastRow() + 1;
+  sh.getRange(start, 1, rows.length, rows[0].length).setValues(rows);
+}
+
+function now_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+}
+
+function cellA1_(r0, c0) {
+  return toA1_(r0 + 1, c0 + 1);
+}
+function toA1_(row, col) {
+  let s = "";
+  let n = col;
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s + row;
+}
+
+function findCol_(headers, keys) {
+  const lower = headers.map(h => String(h || "").toLowerCase());
+  for (let i = 0; i < lower.length; i++) {
+    for (const k of keys) {
+      const kk = String(k).toLowerCase();
+      if (lower[i] === kk) return i;
+      if (lower[i].indexOf(kk) >= 0) return i;
+    }
+  }
+  return -1;
+}
+
+function splitList_(v) {
+  const s = String(v || "").trim();
+  if (!s) return [];
+  return s.split(/[\s,]+/).map(x => String(x || "").trim()).filter(Boolean);
+}
+
+function hitList_(needles, haystack) {
+  for (const n of needles) {
+    if (haystack.indexOf(n) >= 0) return n;
+  }
+  return "";
+}
+
+function norm_(v) {
+  return String(v || "").trim().toUpperCase();
+}
