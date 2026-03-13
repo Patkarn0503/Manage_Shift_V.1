@@ -1,0 +1,385 @@
+/********************************
+ * STEP E1 (OPD ONLY, 3-PASS)
+ * เติม "OPD" ลงช่องว่างที่เหลือ (เฉพาะ OPD) ต่อจาก Result เดิม
+ *
+ * ใช้ OUT_D:
+ * - Department
+ * - Must_Pair
+ * - Must_Not_Pair
+ * - Weekday_M, Weekday_E, Weekday_N
+ * - Weekend_M, Weekend_E, Weekend_N, Weekend_N_before_WD
+ * - Weekday_ME, Weekend_ME  (อยากขึ้น M+E ติดกัน)
+ * - Ideal_shift (โควต้ารวมทั้งเดือน)
+ *
+ * เงื่อนไข:
+ * - ห้าม OPD ลงเวรติดต่อกันเกิน 2 เวร (timeline)
+ * - ใช้ Must_Pair / Must_Not_Pair ของ OPD
+ * - ในเวรเดียวกันห้ามซ้ำ OPD (ถ้ามี OPD อยู่แล้วอีกช่องจะไม่ลงซ้ำ)
+ * - ใช้สี highlight ใน Result เพื่อแยก Weekday/Weekend/WN_before_WD (ไม่คำนวณวันใหม่)
+ *
+ * 3 pass:
+ * 1) Weekday ก่อน
+ * 2) Weekend (ยกเว้น N_before_WD)
+ * 3) Weekend_N_before_WD
+ ********************************/
+
+function runStepE1_Fill_OPD_Only_3Pass() {
+  const ss = SpreadsheetApp.getActive();
+
+  const RULE_SHEET   = "OUT_D";
+  const RESULT_SHEET = "Result";
+  const LOG_SHEET    = "Log";
+
+  const DEPT = "OPD";
+
+  // ---- ปรับน้ำหนักได้ ----
+  const W_DESIRE      = 120; // น้ำหนัก desire ของกะนั้น ๆ
+  const W_ME_BONUS    = 80;  // โบนัสถ้าอยาก M+E ติดกัน (ตาม *_ME)
+  const W_QUOTA_RATIO = 40;  // ดันถ้ายังเหลือโควต้าเยอะ (กันค้าง)
+  // ------------------------
+
+  const ruleSh   = ss.getSheetByName(RULE_SHEET);
+  const resultSh = ss.getSheetByName(RESULT_SHEET);
+  if (!ruleSh)   throw new Error('ไม่พบชีท "' + RULE_SHEET + '"');
+  if (!resultSh) throw new Error('ไม่พบชีท "' + RESULT_SHEET + '"');
+
+  const rules = readRulesFromOutD_Ideal_(ruleSh);
+  if (!rules[DEPT]) throw new Error('ไม่พบกติกาของแผนก "' + DEPT + '" ในชีท OUT_D');
+
+  const range = resultSh.getDataRange();
+  const data = range.getValues();
+  const bgs  = range.getBackgrounds();
+  if (data.length < 2) return;
+
+  const lastRow = data.length;
+
+  // detect weekend color from Result highlight
+  const weekendColor = detectWeekendColor_(bgs);
+  function isWeekendRow_(r) {
+    const c = normColor_(bgs[r][0]);
+    return c && c !== "#ffffff" && c !== "white" && c === weekendColor;
+  }
+
+  // count used OPD already in Result
+  let usedOPD = 0;
+  for (let r = 1; r < lastRow; r++) {
+    for (let c = 1; c <= 6; c++) {
+      if (norm_(data[r][c]) === DEPT) usedOPD++;
+    }
+  }
+
+  const ideal = Number(rules[DEPT].ideal || 0);
+  let remaining = Math.max(0, ideal - usedOPD);
+
+  // build timeline
+  const timeline = [];
+  for (let r = 1; r < lastRow; r++) {
+    const day = data[r][0];
+    if (day === "" || day == null) continue;
+    timeline.push({ r, day, shift: "M", cols: [1, 2] });
+    timeline.push({ r, day, shift: "E", cols: [3, 4] });
+    timeline.push({ r, day, shift: "N", cols: [5, 6] });
+  }
+
+  // slot type from colors
+  const slotType = timeline.map(t => {
+    const weekendToday = isWeekendRow_(t.r);
+    const weekendTomorrow = (t.r + 1 < lastRow) ? isWeekendRow_(t.r + 1) : false;
+    const isWN = (t.shift === "N" && weekendToday && !weekendTomorrow);
+    if (isWN) return "WN_B4_WD";
+    if (weekendToday) return "WEEKEND";
+    return "WEEKDAY";
+  });
+
+  // log
+  const log = [];
+  log.push(["ts","step","pass","day","shift","cell","dept","action","reason","score"]);
+
+  function mePotentialBonus_(rowIndex, isWeekend) {
+    const meVal = isWeekend ? Number(rules[DEPT].meWeekend || 0) : Number(rules[DEPT].meWeekday || 0);
+    if (meVal <= 0) return 0;
+
+    const mFilled = [norm_(data[rowIndex][1]), norm_(data[rowIndex][2])].filter(Boolean);
+    const eFilled = [norm_(data[rowIndex][3]), norm_(data[rowIndex][4])].filter(Boolean);
+
+    const mHasOPD = mFilled.includes(DEPT);
+    const eHasOPD = eFilled.includes(DEPT);
+
+    const mHasEmpty = (mFilled.length < 2);
+    const eHasEmpty = (eFilled.length < 2);
+
+    // ให้โบนัสเมื่อมีโอกาสทำ M+E วันเดียวกัน
+    if ((mHasOPD && eHasEmpty) || (eHasOPD && mHasEmpty) || (mHasEmpty && eHasEmpty)) {
+      return meVal * W_ME_BONUS;
+    }
+    return 0;
+  }
+
+  function allDone_() {
+    return remaining <= 0;
+  }
+
+  function runPass_(passName, acceptTypeFn) {
+    let filled = 0;
+
+    for (let i = 0; i < timeline.length; i++) {
+      if (!acceptTypeFn(slotType[i])) continue;
+      if (allDone_()) break;
+
+      const t = timeline[i];
+      const type = slotType[i];
+
+      const weekendToday = (type !== "WEEKDAY");
+      const isWNBeforeWD = (type === "WN_B4_WD");
+
+      for (const col of t.cols) {
+        if (norm_(data[t.r][col])) continue;
+        if (allDone_()) break;
+
+        const inThisShift = t.cols.map(c => norm_(data[t.r][c])).filter(Boolean);
+
+        // 0) กันซ้ำ OPD ในเวรเดียวกัน
+        if (inThisShift.includes(DEPT)) {
+          log.push([now_(),"E1",passName,t.day,t.shift,cellA1_(t.r, col),DEPT,"SKIP","already OPD in same shift",""]);
+          continue;
+        }
+
+        // 1) availability by desire
+        const desire = getDesire_(rules[DEPT], t.shift, weekendToday, isWNBeforeWD);
+        if (desire <= 0) {
+          log.push([now_(),"E1",passName,t.day,t.shift,cellA1_(t.r, col),DEPT,"NOFILL","desire=0",""]);
+          continue;
+        }
+
+        // 2) Must_Not_Pair
+        const hitNot = hitList_(rules[DEPT].mustNotPair, inThisShift);
+        if (hitNot) {
+          log.push([now_(),"E1",passName,t.day,t.shift,cellA1_(t.r, col),DEPT,"NOFILL","hit Must_Not_Pair: "+hitNot,""]);
+          continue;
+        }
+
+        // 3) Must_Pair
+        const mp = rules[DEPT].mustPair || [];
+        if (mp.length) {
+          const hasPairAlready = mp.some(x => inThisShift.indexOf(x) >= 0);
+          const bothEmpty = (inThisShift.length === 0);
+          if (!hasPairAlready && !bothEmpty) {
+            log.push([now_(),"E1",passName,t.day,t.shift,cellA1_(t.r, col),DEPT,"NOFILL","Must_Pair not satisfied",""]);
+            continue;
+          }
+        }
+
+        // 4) consecutive > 2
+        const cons = checkNoMoreThan2Consecutive_(timeline, data, i, DEPT);
+        if (!cons.ok) {
+          log.push([now_(),"E1",passName,t.day,t.shift,cellA1_(t.r, col),DEPT,"NOFILL",cons.reason,""]);
+          continue;
+        }
+
+        // SCORE (จริง ๆ มีตัวเดียว แต่เราเก็บไว้ดู log/ปรับแต่ง)
+        let score = desire * W_DESIRE;
+
+        if (t.shift === "M" || t.shift === "E") {
+          score += mePotentialBonus_(t.r, weekendToday);
+        }
+
+        // ดันถ้ายังเหลือโควต้าเยอะ
+        score += (remaining / Math.max(1, ideal)) * W_QUOTA_RATIO;
+
+        // PLACE
+        resultSh.getRange(t.r + 1, col + 1).setValue(DEPT);
+        data[t.r][col] = DEPT;
+        remaining--;
+        filled++;
+
+        log.push([now_(),"E1",passName,t.day,t.shift,cellA1_(t.r, col),DEPT,"FILL",`type=${type}, desire=${desire}, remain=${remaining}/${ideal}`,String(score)]);
+      }
+    }
+
+    return filled;
+  }
+
+  const f1 = runPass_("PASS1_WEEKDAY", t => t === "WEEKDAY");
+  const f2 = runPass_("PASS2_WEEKEND", t => t === "WEEKEND");
+  const f3 = runPass_("PASS3_WN_BEFORE_WD", t => t === "WN_B4_WD");
+
+  writeLog_(ss, LOG_SHEET, log);
+
+  SpreadsheetApp.getActive().toast(
+    `Step E1(OPD) เสร็จ | เติม: Wkdy=${f1}, Wkend=${f2}, WNbefWD=${f3} | OPD เหลือโควต้า=${remaining}`,
+    "runStepE1_Fill_OPD_Only_3Pass",
+    10
+  );
+}
+
+/* =========================================================
+ * OUT_D Reader (Ideal_shift)
+ * ========================================================= */
+function readRulesFromOutD_Ideal_(sh) {
+  const v = sh.getDataRange().getValues();
+  if (v.length < 2) throw new Error("OUT_D ไม่มีข้อมูล");
+
+  const headers = v[0].map(x => String(x || "").trim());
+
+  const cDept = findCol_(headers, ["Department"]);
+  const cMustPair = findCol_(headers, ["Must_Pair"]);
+  const cMustNot = findCol_(headers, ["Must_Not_Pair"]);
+
+  const cWeekdayM = findCol_(headers, ["Weekday_M"]);
+  const cWeekdayE = findCol_(headers, ["Weekday_E"]);
+  const cWeekdayN = findCol_(headers, ["Weekday_N"]);
+
+  const cWeekendM = findCol_(headers, ["Weekend_M"]);
+  const cWeekendE = findCol_(headers, ["Weekend_E"]);
+  const cWeekendN = findCol_(headers, ["Weekend_N"]);
+  const cWeekendNBefore = findCol_(headers, ["Weekend_N_before_WD"]);
+
+  const cWeekdayME = findCol_(headers, ["Weekday_ME"]);
+  const cWeekendME = findCol_(headers, ["Weekend_ME"]);
+
+  const cIdeal = findCol_(headers, ["Ideal_shift"]);
+
+  const mustHave = [
+    cDept, cMustPair, cMustNot,
+    cWeekdayM, cWeekdayE, cWeekdayN,
+    cWeekendM, cWeekendE, cWeekendN, cWeekendNBefore,
+    cWeekdayME, cWeekendME,
+    cIdeal
+  ];
+  if (mustHave.some(x => x === -1)) {
+    throw new Error("หัวคอลัมน์ใน OUT_D ไม่ครบ/ชื่อไม่ตรง (ต้องมี Ideal_shift และคอลัมน์วัน/กะครบ)");
+  }
+
+  const rules = {};
+  for (let r = 1; r < v.length; r++) {
+    const dept = norm_(v[r][cDept]);
+    if (!dept) continue;
+
+    rules[dept] = {
+      dept,
+      mustPair: splitList_(v[r][cMustPair]).map(norm_).filter(Boolean),
+      mustNotPair: splitList_(v[r][cMustNot]).map(norm_).filter(Boolean),
+
+      avail: {
+        weekday: {
+          M: Number(v[r][cWeekdayM] || 0),
+          E: Number(v[r][cWeekdayE] || 0),
+          N: Number(v[r][cWeekdayN] || 0),
+        },
+        weekend: {
+          M: Number(v[r][cWeekendM] || 0),
+          E: Number(v[r][cWeekendE] || 0),
+          N: Number(v[r][cWeekendN] || 0),
+          N_before_WD: Number(v[r][cWeekendNBefore] || 0),
+        }
+      },
+
+      meWeekday: Number(v[r][cWeekdayME] || 0),
+      meWeekend: Number(v[r][cWeekendME] || 0),
+
+      ideal: Number(v[r][cIdeal] || 0),
+    };
+  }
+  return rules;
+}
+
+/* ===============================
+ * Desire getter
+ * =============================== */
+function getDesire_(rule, shiftKey, isWeekend, isWeekendNightBeforeWD) {
+  if (!rule || !rule.avail) return 0;
+  if (isWeekend && shiftKey === "N" && isWeekendNightBeforeWD) {
+    return Number(rule.avail.weekend.N_before_WD || 0);
+  }
+  const side = isWeekend ? "weekend" : "weekday";
+  return Number(rule.avail[side][shiftKey] || 0);
+}
+
+/* ===============================
+ * Consecutive check
+ * =============================== */
+function checkNoMoreThan2Consecutive_(timeline, data, idx, dept) {
+  const d = norm_(dept);
+  let run = 1;
+
+  for (let i = idx - 1; i >= 0; i--) {
+    if (shiftHasDept_(timeline[i], data, d)) run++;
+    else break;
+  }
+  for (let i = idx + 1; i < timeline.length; i++) {
+    if (shiftHasDept_(timeline[i], data, d)) run++;
+    else break;
+  }
+
+  if (run > 2) return { ok: false, reason: "ติดกันเกิน 2 เวร (run=" + run + ")" };
+  return { ok: true, reason: "" };
+}
+function shiftHasDept_(t, data, dept) {
+  return t.cols.some(c => norm_(data[t.r][c]) === dept);
+}
+
+/* ===============================
+ * Weekend color detect
+ * =============================== */
+function detectWeekendColor_(bgs) {
+  for (let r = 1; r < bgs.length; r++) {
+    const c = normColor_(bgs[r][0]);
+    if (c && c !== "#ffffff" && c !== "white") return c;
+  }
+  return "#f6c6a5";
+}
+function normColor_(c) {
+  if (!c) return "";
+  return String(c).trim().toLowerCase();
+}
+
+/* ===============================
+ * Log + utils
+ * =============================== */
+function writeLog_(ss, sheetName, rows) {
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) sh = ss.insertSheet(sheetName);
+  const start = sh.getLastRow() + 1;
+  sh.getRange(start, 1, rows.length, rows[0].length).setValues(rows);
+}
+function now_() {
+  return Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "yyyy-MM-dd HH:mm:ss");
+}
+function cellA1_(r0, c0) {
+  return toA1_(r0 + 1, c0 + 1);
+}
+function toA1_(row, col) {
+  let s = "";
+  let n = col;
+  while (n > 0) {
+    const m = (n - 1) % 26;
+    s = String.fromCharCode(65 + m) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s + row;
+}
+function findCol_(headers, keys) {
+  const lower = headers.map(h => String(h || "").toLowerCase());
+  for (let i = 0; i < lower.length; i++) {
+    for (const k of keys) {
+      const kk = String(k).toLowerCase();
+      if (lower[i] === kk) return i;
+      if (lower[i].indexOf(kk) >= 0) return i;
+    }
+  }
+  return -1;
+}
+function splitList_(v) {
+  const s = String(v || "").trim();
+  if (!s) return [];
+  return s.split(/[\s,]+/).map(x => String(x || "").trim()).filter(Boolean);
+}
+function hitList_(needles, haystack) {
+  for (const n of needles) {
+    if (haystack.indexOf(n) >= 0) return n;
+  }
+  return "";
+}
+function norm_(v) {
+  return String(v || "").trim().toUpperCase();
+}
